@@ -1,0 +1,13 @@
+{
+  "projects": {
+    "default": "my-journaly"
+  },
+  "targets": {
+    "my-journaly": {
+      "hosting": {
+        "app": ["myjournaly-app"],
+        "admin": ["myjournaly-admin"]
+      }
+    }
+  }
+}
