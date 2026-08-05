@@ -75,7 +75,7 @@ async def update_link(link_id: str, updates: dict, user: dict = Depends(get_curr
     if not doc.exists or doc.to_dict().get("user_id") != user["uid"]:
         raise HTTPException(status_code=404, detail="Link not found")
     # Restrict to safe-to-mutate fields
-    allowed = {"link_strength", "link_description", "link_source", "link_source_confidence", "link_type"}
+    allowed = {"link_strength", "link_description", "link_source", "link_source_confidence", "link_type", "status"}
     sanitized = {k: v for k, v in updates.items() if k in allowed}
     if not sanitized:
         raise HTTPException(status_code=400, detail="No valid fields to update")

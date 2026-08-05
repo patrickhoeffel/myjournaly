@@ -26,6 +26,20 @@ class LinkType(str, Enum):
     REFERENCE = "reference"
 
 
+class LinkStatus(str, Enum):
+    """Lifecycle of an association.
+
+    Lets the graph tell apart what the user asserted from what the association
+    engine proposed — and, crucially, remember rejections so a dismissed
+    suggestion is never surfaced again.
+    """
+
+    CONFIRMED = "confirmed"  # user-created or user-approved (default for hand-made links)
+    AUTO = "auto"            # applied automatically by the engine at high confidence
+    PROPOSED = "proposed"    # suggested by the engine, awaiting the user's confirm/dismiss
+    REJECTED = "rejected"    # user dismissed a proposal — a tombstone that suppresses re-suggesting
+
+
 class Link(BaseModel):
     """Universal link record connecting any two entities."""
 
@@ -42,6 +56,9 @@ class Link(BaseModel):
     link_description: str | None = None
     link_source: str | None = None  # provenance or rationale for this link - how did I arrive at this connection in my own mind?
     link_source_confidence: float = 1.0  # 0.0 to 1.0 - how confident am I in the source of this link?
+    # Defaults to CONFIRMED so every pre-existing and hand-made link reads as
+    # user-asserted; the association engine explicitly sets AUTO / PROPOSED.
+    status: LinkStatus = LinkStatus.CONFIRMED
     valid_begin_date: datetime | None = None  # when this relationship began in reality
     valid_end_date: datetime | None = None  # when this relationship ended in reality (None = ongoing)
     created_at: datetime = Field(default_factory=datetime.utcnow)
