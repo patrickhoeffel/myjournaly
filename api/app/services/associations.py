@@ -28,7 +28,7 @@ from typing import Iterable
 # ── Tunable parameters ─────────────────────────────────────────────────────
 # These are the knobs the dry run exists to calibrate. Start conservative.
 
-AUTO_THRESHOLD = 0.70      # confidence at/above which a link would be applied silently
+AUTO_THRESHOLD = 0.80      # confidence at/above which a link would be applied silently
 SUGGEST_THRESHOLD = 0.50   # confidence at/above which a link would be proposed to the user
 
 TIME_TAU_HOURS = 12.0      # exponential falloff constant for time OUTSIDE an event's range
@@ -161,28 +161,23 @@ def geo_score(
 def combine(time_s: float, geo_s: float | None) -> float:
     """Fuse the time and geo signals into a single confidence.
 
-    Design intent (see doc):
-      * Time-only must be first-class — a photo squarely inside an event's span
-        reaches AUTO with no GPS at all (the common honeymoon-photos case).
-      * When geo agrees, it corroborates and can only help.
-      * But geo ALONE can't reach AUTO. Location repeats (home, a hometown);
-        time doesn't. Without real temporal proximity, a same-place match is at
-        most a suggestion — otherwise every photo ever taken at home would
-        auto-link to one event that happened at home.
-      * When geo clearly disagrees (photo far from the pinned place), it tempers
-        confidence — but a strong time match still keeps a loud voice, so more
-        information never sharply *lowers* a confident time match.
+    Design intent (see doc; calibrated against real data):
+      * Time is the primary signal. A photo squarely inside an event's span
+        reaches AUTO on time alone, with or without GPS.
+      * Geo is CORROBORATION ONLY — it can lift a plausible time match, but it
+        never penalizes one. Events are pinned to a single point while real
+        activity (a getaway) spreads across miles, so "far from the pin" is a
+        weak signal for "wrong event"; subtracting for it mislabels ordinary
+        trip photos.
+      * Geo can't manufacture a match on its own. Location repeats (home); time
+        doesn't. So when the time signal is below the suggest floor, geo is
+        ignored entirely — a same-place/wrong-time photo simply drops out.
     """
-    if geo_s is None:
+    if geo_s is None or time_s < SUGGEST_THRESHOLD:
         return time_s
-    if geo_s >= 0.5:  # geo agrees → corroboration boost
-        boosted = max(time_s, geo_s) + 0.15 * min(time_s, geo_s)
-        if time_s < 0.5:
-            # place matches but time doesn't — cap in the "propose" band, never auto.
-            return min(boosted, 0.75)
-        return min(1.0, boosted)
-    # geo disagrees (photo looks to be elsewhere) → temper, but keep time's voice
-    return time_s * (0.7 + 0.3 * geo_s)
+    # Geo lifts within the remaining headroom — additive, bounded, saturating.
+    # At time_s == 1.0 the boost is 0 (already maxed), so geo can only ever help.
+    return min(1.0, time_s + 0.30 * geo_s * (1.0 - time_s))
 
 
 def tier_for(confidence: float) -> str:

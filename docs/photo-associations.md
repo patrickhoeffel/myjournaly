@@ -37,7 +37,7 @@ by confidence tier:
 
 | Combined confidence | Action | `Link.status` |
 |---|---|---|
-| ≥ `AUTO_THRESHOLD` (0.70) | Applied silently (visible + one-tap undo) | `auto` |
+| ≥ `AUTO_THRESHOLD` (0.80) | Applied silently (visible + one-tap undo) | `auto` |
 | ≥ `SUGGEST_THRESHOLD` (0.50) | Proposed for one-tap confirm | `proposed` |
 | below | Dropped | — |
 
@@ -57,11 +57,17 @@ by confidence tier:
 
 - **Time-only is first-class:** a photo squarely inside an event's span reaches
   `auto` with no GPS (the honeymoon-photos case).
-- **Geo agreeing** corroborates and can only help.
-- **Geo disagreeing** (photo far from the pinned place) tempers confidence — but
-  a strong time match keeps a loud voice, so *adding* a far GPS reading never
-  sharply drops a confident time match; it just moves it from `auto` to
-  `proposed` for a human glance.
+- **Geo agreeing** corroborates and lifts confidence (within the remaining
+  headroom, so it can only ever help).
+- **Geo never penalizes.** Calibration against real data (an anniversary getaway:
+  41 photos, all `time=1.00`, but geo scattered `0.07–0.99` because the event is
+  pinned to one point while the trip spread across the valley) showed that "far
+  from the pin" is a weak signal for "wrong event." So a low geo score is
+  *ignored*, never subtracted — a photo inside a trip's dates auto-links wherever
+  in the area it was taken.
+- **Geo can't create a match alone.** Location repeats (home); time doesn't. When
+  the time signal is below the suggest floor, geo is ignored — a same-place,
+  wrong-time photo drops out rather than nagging.
 
 The exact formula and all thresholds live in
 [`api/app/services/associations.py`](../api/app/services/associations.py) and
