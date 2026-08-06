@@ -21,8 +21,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import firebase_admin
-from firebase_admin import firestore
+import google.auth
+from google.cloud import firestore
 
 from app.config import settings
 from app.services.associations import (
@@ -77,10 +77,17 @@ def main() -> None:
     #     (delectable-cloud-dev) — not where the data lives.
     # Override by exporting JOURNALY_PROJECT_ID if you ever need a different one.
     project_id = settings.project_id or "my-journaly"
-    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
 
-    app = firebase_admin.initialize_app(options={"projectId": project_id})
-    db = firestore.client(app)
+    # Pin the QUOTA (billing) project onto the credentials themselves. We can't
+    # use `gcloud auth application-default set-quota-project my-journaly` — that
+    # command bills its own permission check to the current quota project
+    # (delectable-cloud-dev), where this account has no serviceusage permission,
+    # so it fails before it can change anything. Setting it here sidesteps global
+    # ADC config entirely and leaves the Delectable setup untouched.
+    creds, _ = google.auth.default()
+    if hasattr(creds, "with_quota_project"):
+        creds = creds.with_quota_project(project_id)
+    db = firestore.Client(project=project_id, credentials=creds)
 
     print("=== Photo → Event association DRY RUN ===")
     print(f"Firestore project: {db.project}")
