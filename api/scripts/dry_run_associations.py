@@ -69,11 +69,17 @@ def _short(s: str, n: int = 8) -> str:
 def main() -> None:
     target_user = sys.argv[1] if len(sys.argv) > 1 else None
 
-    options = {}
-    if settings.project_id:
-        options["projectId"] = settings.project_id
-        options["storageBucket"] = settings.storage_bucket
-    app = firebase_admin.initialize_app(options=options)
+    # Pin to the My Journaly project explicitly. This must not be left to the
+    # ambient config because:
+    #   * this worktree has no .env (it's gitignored), so settings.project_id is
+    #     empty when run from here; and
+    #   * the machine's gcloud/ADC default points at another project
+    #     (delectable-cloud-dev) — not where the data lives.
+    # Override by exporting JOURNALY_PROJECT_ID if you ever need a different one.
+    project_id = settings.project_id or "my-journaly"
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", project_id)
+
+    app = firebase_admin.initialize_app(options={"projectId": project_id})
     db = firestore.client(app)
 
     print("=== Photo → Event association DRY RUN ===")
