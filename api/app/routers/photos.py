@@ -99,6 +99,15 @@ async def upload_photo(
     data = photo.to_firestore()
     doc_ref = db.collection(PHOTOS).document()
     await doc_ref.set(data)
+
+    # Best-effort: weave the new photo into the graph (auto/proposed links to
+    # matching events). Never let an association failure break the upload.
+    try:
+        from app.services.association_engine import associate_photo_on_upload
+        await associate_photo_on_upload(db, user_id, doc_ref.id, data)
+    except Exception:
+        logger.warning("photo association failed for %s", doc_ref.id, exc_info=True)
+
     return Photo.from_firestore(doc_ref.id, data)
 
 

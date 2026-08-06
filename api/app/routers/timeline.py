@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.models.event import Event
@@ -16,7 +18,19 @@ from app.services.firestore import (
     TIMELINE_SEASONS,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/timeline", tags=["timeline"])
+
+
+async def _associate_event_photos(db, uid: str, event_id: str) -> None:
+    """Best-effort: link matching photos to an event after it's saved. Never let
+    an association failure break the event write."""
+    try:
+        from app.services.association_engine import associate_event_on_save
+        await associate_event_on_save(db, uid, event_id)
+    except Exception:
+        logger.warning("event association failed for %s", event_id, exc_info=True)
 
 
 # ── Timeline Types (read-only for users) ──
@@ -144,6 +158,8 @@ async def create_timeline_event(payload: dict, user: dict = Depends(get_current_
         }
         await db.collection(LINKS).document().set(link_data)
 
+    await _associate_event_photos(db, uid, event_id)
+
     result = Event.from_firestore(event_id, data).model_dump(mode="json")
     result["user_timeline_id"] = user_timeline_id or ""
     return result
@@ -169,6 +185,8 @@ async def update_timeline_event(event_id: str, payload: dict, user: dict = Depen
     event = Event(**{k: v for k, v in existing.items() if k != "id"})
     data = event.to_firestore()
     await doc_ref.update(data)
+
+    await _associate_event_photos(db, user["uid"], event_id)
 
     result = Event.from_firestore(event_id, data).model_dump(mode="json")
     result["user_timeline_id"] = user_timeline_id or ""
