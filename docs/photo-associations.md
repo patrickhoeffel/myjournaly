@@ -37,7 +37,7 @@ by confidence tier:
 
 | Combined confidence | Action | `Link.status` |
 |---|---|---|
-| ≥ `AUTO_THRESHOLD` (0.85) | Applied silently (visible + one-tap undo) | `auto` |
+| ≥ `AUTO_THRESHOLD` (0.70) | Applied silently (visible + one-tap undo) | `auto` |
 | ≥ `SUGGEST_THRESHOLD` (0.50) | Proposed for one-tap confirm | `proposed` |
 | below | Dropped | — |
 

@@ -28,7 +28,7 @@ from typing import Iterable
 # ── Tunable parameters ─────────────────────────────────────────────────────
 # These are the knobs the dry run exists to calibrate. Start conservative.
 
-AUTO_THRESHOLD = 0.85      # confidence at/above which a link would be applied silently
+AUTO_THRESHOLD = 0.70      # confidence at/above which a link would be applied silently
 SUGGEST_THRESHOLD = 0.50   # confidence at/above which a link would be proposed to the user
 
 TIME_TAU_HOURS = 12.0      # exponential falloff constant for time OUTSIDE an event's range
