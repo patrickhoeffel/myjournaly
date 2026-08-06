@@ -1,5 +1,33 @@
-from datetime import datetime
-from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field, field_validator
+
+
+def _to_utc_aware(v):
+    """Coerce anything into a UTC-aware datetime, or return None.
+
+    Handles: None; ISO strings with or without Z / offset / fractional seconds;
+    naive datetimes (treated as UTC — this matches how the fixed client sends
+    them, as `.toISOString()` always produces UTC); already-aware datetimes.
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.replace("Z", "+00:00") if v.endswith("Z") else v
+        try:
+            v = datetime.fromisoformat(s)
+        except ValueError:
+            # Last-ditch: try trimming any fractional seconds and offset
+            try:
+                v = datetime.fromisoformat(s[:19])
+            except ValueError:
+                return None
+    if not isinstance(v, datetime):
+        return None
+    if v.tzinfo is None:
+        # Treat naive as UTC — this is what the fixed client produces via
+        # `.toISOString()` on a Date already adjusted with the EXIF offset.
+        return v.replace(tzinfo=timezone.utc)
+    return v.astimezone(timezone.utc)
 
 
 class Photo(BaseModel):
@@ -39,11 +67,19 @@ class Photo(BaseModel):
     # Additional EXIF fields kept as a free-form blob for future use
     exif: dict | None = None
 
+    # SHA-256 of the uploaded bytes — used for dedup on future uploads.
+    sha256_hash: str | None = None
+
     # User-editable metadata
     caption: str | None = None
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @field_validator("taken_at", mode="before")
+    @classmethod
+    def _normalize_taken_at(cls, v):
+        return _to_utc_aware(v)
 
     def to_firestore(self) -> dict:
         return self.model_dump(exclude={"id"}, mode="json")

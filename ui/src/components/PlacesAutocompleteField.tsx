@@ -31,6 +31,8 @@ interface PlacesAutocompleteFieldProps {
   label?: string;
   placeholder?: string;
   helperText?: string;
+  /** Bias autocomplete results toward this lat/lng (e.g., a photo's GPS). */
+  locationBias?: { lat: number; lng: number; radiusMeters?: number };
 }
 
 export default function PlacesAutocompleteField({
@@ -38,6 +40,7 @@ export default function PlacesAutocompleteField({
   label,
   placeholder,
   helperText,
+  locationBias,
 }: PlacesAutocompleteFieldProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const onPickRef = useRef(onPick);
@@ -62,6 +65,17 @@ export default function PlacesAutocompleteField({
         const el = new PaeCtor();
         if (placeholder) el.setAttribute("placeholder", placeholder);
         el.style.width = "100%";
+        // Bias search toward a specific point (e.g. photo GPS) when provided.
+        if (locationBias) {
+          try {
+            (el as unknown as { locationBias: unknown }).locationBias = {
+              center: { lat: locationBias.lat, lng: locationBias.lng },
+              radius: locationBias.radiusMeters ?? 5000,
+            };
+          } catch (e) {
+            console.warn("Failed to set locationBias on PlaceAutocompleteElement", e);
+          }
+        }
         containerRef.current.appendChild(el);
         element = el;
 
@@ -108,7 +122,7 @@ export default function PlacesAutocompleteField({
       cancelled = true;
       if (element) element.remove();
     };
-  }, [placeholder]);
+  }, [placeholder, locationBias?.lat, locationBias?.lng, locationBias?.radiusMeters]);
 
   return (
     <Box>

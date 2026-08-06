@@ -26,7 +26,7 @@ interface PhotoDropzoneProps {
 
 interface FileItem {
   file: File;
-  status: "pending" | "uploading" | "done" | "error";
+  status: "pending" | "uploading" | "done" | "error" | "aborted";
   error?: string;
 }
 
@@ -113,16 +113,32 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
   const folderInput = useRef<HTMLInputElement>(null);
   const filesInput = useRef<HTMLInputElement>(null);
   const zipInput = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const abortedRef = useRef(false);
+  const uploadedCountRef = useRef(0);
 
   const reset = () => {
     setFiles([]);
     setUploading(false);
     setUploadedCount(0);
     setFailedCount(0);
+    abortedRef.current = false;
+    abortRef.current = null;
+  };
+
+  const abortUpload = () => {
+    // Stop pulling from the queue and cancel any in-flight fetches.
+    abortedRef.current = true;
+    abortRef.current?.abort();
   };
 
   const handleClose = () => {
-    if (uploading) return;
+    if (uploading) {
+      // Cancel button during upload = abort. Dialog stays open so the user
+      // sees the partial results (some done, some aborted).
+      abortUpload();
+      return;
+    }
     reset();
     onClose();
   };
@@ -173,8 +189,14 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
       const data = await exifr.parse(file, { gps: true, translateValues: true, reviveValues: true }) as Record<string, unknown> | undefined;
       if (!data) return { taken_at: null, gps_lat: null, gps_lng: null, gps_altitude: null, width: null, height: null, exif: null };
       const dt = (data.DateTimeOriginal || data.CreateDate || data.DateTime) as Date | undefined;
+
+      // exifr already applies OffsetTimeOriginal when parsing EXIF DateTimeOriginal —
+      // its Date represents the correct UTC instant. Trust it. Do NOT combine
+      // the offset again (doing so was a bug that shifted times by the offset).
+      const taken_at = dt instanceof Date ? dt.toISOString() : null;
+
       return {
-        taken_at: dt instanceof Date ? dt.toISOString() : null,
+        taken_at,
         gps_lat: typeof data.latitude === "number" ? data.latitude : null,
         gps_lng: typeof data.longitude === "number" ? data.longitude : null,
         gps_altitude: typeof data.altitude === "number" ? data.altitude : null,
@@ -218,19 +240,30 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: fd,
+        signal: abortRef.current?.signal,
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       setFiles((prev) => prev.map((f, i) => (i === index ? { ...f, status: "done" } : f)));
       setUploadedCount((c) => c + 1);
+      uploadedCountRef.current += 1;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Upload failed";
-      setFiles((prev) => prev.map((f, i) => (i === index ? { ...f, status: "error", error: msg } : f)));
-      setFailedCount((c) => c + 1);
+      const isAbort = e instanceof DOMException && e.name === "AbortError";
+      if (isAbort) {
+        setFiles((prev) => prev.map((f, i) => (i === index ? { ...f, status: "aborted" } : f)));
+        setFailedCount((c) => c + 1);
+      } else {
+        const msg = e instanceof Error ? e.message : "Upload failed";
+        setFiles((prev) => prev.map((f, i) => (i === index ? { ...f, status: "error", error: msg } : f)));
+        setFailedCount((c) => c + 1);
+      }
     }
   };
 
   const startUpload = async () => {
     if (files.length === 0) return;
+    abortedRef.current = false;
+    abortRef.current = new AbortController();
+    uploadedCountRef.current = 0;
     setUploading(true);
     setUploadedCount(0);
     setFailedCount(0);
@@ -239,22 +272,30 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
     const queue = files.map((_, i) => i);
     const workers = Array.from({ length: CONCURRENCY }, async () => {
       while (queue.length) {
+        if (abortedRef.current) return;
         const idx = queue.shift();
         if (idx == null) return;
         await uploadOne(files[idx], idx);
       }
     });
     await Promise.all(workers);
+    // Any files still "pending" (workers stopped) become "aborted".
+    setFiles((prev) => prev.map((f) => (f.status === "pending" ? { ...f, status: "aborted" as const } : f)));
     setUploading(false);
-    onUploaded(files.length);
+    onUploaded(uploadedCountRef.current);
   };
 
-  const done = files.length > 0 && uploadedCount + failedCount === files.length;
-  const progress = files.length ? Math.round(((uploadedCount + failedCount) / files.length) * 100) : 0;
+  // Base "done" on actual file statuses so aborted-while-pending files count.
+  const doneCount = files.filter((f) => f.status === "done").length;
+  const failedActualCount = files.filter((f) => f.status === "error").length;
+  const abortedCount = files.filter((f) => f.status === "aborted").length;
+  const settledCount = files.filter((f) => f.status !== "pending" && f.status !== "uploading").length;
+  const done = files.length > 0 && !uploading && settledCount === files.length;
+  const progress = files.length ? Math.round((settledCount / files.length) * 100) : 0;
 
   return (
     <Dialog open={open} onClose={handleClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Upload photos</DialogTitle>
+      <DialogTitle>Upload Photos</DialogTitle>
       <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <Box
           onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
@@ -342,9 +383,9 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
           <Box>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 0.5 }}>
               {uploading
-                ? `Uploading… ${uploadedCount + failedCount} / ${files.length}`
+                ? `Uploading… ${settledCount} / ${files.length}`
                 : done
-                  ? `Done. ${uploadedCount} uploaded${failedCount ? `, ${failedCount} failed` : ""}.`
+                  ? `Done. ${doneCount} uploaded${failedActualCount ? `, ${failedActualCount} failed` : ""}${abortedCount ? `, ${abortedCount} canceled` : ""}.`
                   : `${files.length} photo${files.length === 1 ? "" : "s"} ready`}
             </Typography>
             {uploading && <LinearProgress variant="determinate" value={progress} sx={{ mb: 1 }} />}
@@ -370,20 +411,30 @@ export default function PhotoDropzone({ open, onClose, onUploaded }: PhotoDropzo
                   {f.status === "uploading" && <CircularProgress size={12} />}
                   {f.status === "done" && <Typography variant="caption" color="success.main">✓</Typography>}
                   {f.status === "error" && <Typography variant="caption" color="error" title={f.error}>failed</Typography>}
+                  {f.status === "aborted" && <Typography variant="caption" color="text.disabled">canceled</Typography>}
                 </Box>
               ))}
             </Box>
-            {failedCount > 0 && !uploading && (
+            {failedActualCount > 0 && !uploading && (
               <Alert severity="warning" sx={{ mt: 1 }}>
-                {failedCount} photo{failedCount === 1 ? "" : "s"} failed to upload.
+                {failedActualCount} photo{failedActualCount === 1 ? "" : "s"} failed to upload.
+              </Alert>
+            )}
+            {abortedCount > 0 && !uploading && (
+              <Alert severity="info" sx={{ mt: 1 }}>
+                {abortedCount} photo{abortedCount === 1 ? "" : "s"} canceled.
               </Alert>
             )}
           </Box>
         )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={handleClose} disabled={uploading} sx={{ textTransform: "none" }}>
-          {done ? "Close" : "Cancel"}
+        <Button
+          onClick={handleClose}
+          color={uploading ? "error" : "primary"}
+          sx={{ textTransform: "none" }}
+        >
+          {uploading ? "Cancel upload" : done ? "Close" : "Cancel"}
         </Button>
         {!done && (
           <Button

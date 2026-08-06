@@ -46,8 +46,10 @@ async def upload_image(
     bucket = _get_bucket()
     blob = bucket.blob(path)
     blob.upload_from_string(contents, content_type=file.content_type)
-    blob.make_public()
-    public_url = blob.public_url
+    # Bucket uses uniform bucket-level access; per-object ACLs are disallowed.
+    # Rely on bucket-level IAM (allUsers → Storage Object Viewer) and just
+    # construct the canonical public URL.
+    public_url = f"https://storage.googleapis.com/{bucket.name}/{path}"
 
     # If entity_type is 'profile', update the user's photo_url in Firestore
     if entity_type == "profile":

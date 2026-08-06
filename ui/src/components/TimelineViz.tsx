@@ -3,6 +3,10 @@ import * as d3 from "d3";
 
 export interface TimelineVizHandle {
   zoomTo: (start: Date, end: Date) => void;
+  /** Pop the previous programmatic zoom off history and apply it. Returns true if a jump happened. */
+  zoomBack: () => boolean;
+  /** True if there's at least one entry in the zoom-back history. */
+  canZoomBack: () => boolean;
 }
 
 // ── Types ──
@@ -91,6 +95,14 @@ interface TimelineVizProps {
   onClickSeason?: (season: TimelineSeason, clientX: number, clientY: number) => void;
   onClickPhoto?: (photo: TimelinePhoto, clientX: number, clientY: number) => void;
   onClickPhotoCluster?: (photos: TimelinePhoto[], clientX: number, clientY: number) => void;
+  /** Fires when the mouse enters a single (non-cluster) photo thumb. `rect` is the thumb's viewport rect. */
+  onHoverPhoto?: (photo: TimelinePhoto, rect: DOMRect) => void;
+  onUnhoverPhoto?: () => void;
+  /** Fires when the mouse enters a cluster (+N) bubble. `rect` is the bubble's viewport rect. */
+  onHoverCluster?: (photos: TimelinePhoto[], rect: DOMRect) => void;
+  onUnhoverCluster?: () => void;
+  onToggleShowPhotos?: (visible: boolean) => void;
+  onZoomHistoryChange?: (depth: number) => void;
   selectedEventId?: string | null;
   selectedSeasonId?: string | null;
 }
@@ -103,9 +115,13 @@ const LINE_SPACING = 28;
 const LINES_MIN_PAD = 20; // padding above first line + below last line
 const FLAG_CIRCLE_R = 4;
 
-const PHOTO_BAND_HEIGHT = 56; // px reserved at the top when photos are shown
+const PHOTO_ROW_HEIGHT = 50; // extra vertical space when the photos row is present in the lines section
 const PHOTO_THUMB_SIZE = 40;
 const PHOTO_THUMB_GAP = 4;
+const PHOTO_COLOR = "#7E57C2";
+// Small clusters get force-spread into a row of individual thumbs with
+// connector lines to their actual time. Above this size we keep the +N bubble.
+const PHOTO_SPREAD_MAX = 12;
 
 const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function TimelineViz({
   lines,
@@ -123,6 +139,12 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
   onClickSeason,
   onClickPhoto,
   onClickPhotoCluster,
+  onHoverPhoto,
+  onUnhoverPhoto,
+  onHoverCluster,
+  onUnhoverCluster,
+  onToggleShowPhotos,
+  onZoomHistoryChange,
   selectedEventId,
   selectedSeasonId,
 }, ref) {
@@ -132,6 +154,33 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
   const overlayRef = useRef<d3.Selection<SVGRectElement, unknown, null, undefined> | null>(null);
   const xScaleRef = useRef<d3.ScaleTime<number, number> | null>(null);
   const chartWidthRef = useRef<number>(0);
+  // Zoom-back history: stack of prior transforms pushed on programmatic zoom (zoomTo / cluster click).
+  const zoomHistoryRef = useRef<d3.ZoomTransform[]>([]);
+  const currentTransformRef = useRef<d3.ZoomTransform>(d3.zoomIdentity);
+
+  // Stabilize callback props so parent re-renders don't invalidate `draw` (which
+  // would wipe the SVG mid-transition and break zoom animations).
+  const callbacksRef = useRef({
+    onToggleVisible, onToggleEventsVisible,
+    onEditEvent, onEditSeason, onEditLine,
+    onClickEvent, onClickSeason,
+    onClickPhoto, onClickPhotoCluster,
+    onHoverPhoto, onUnhoverPhoto,
+    onHoverCluster, onUnhoverCluster,
+    onToggleShowPhotos,
+    onZoomHistoryChange,
+  });
+  callbacksRef.current = {
+    onToggleVisible, onToggleEventsVisible,
+    onEditEvent, onEditSeason, onEditLine,
+    onClickEvent, onClickSeason,
+    onClickPhoto, onClickPhotoCluster,
+    onHoverPhoto, onUnhoverPhoto,
+    onHoverCluster, onUnhoverCluster,
+    onToggleShowPhotos,
+    onZoomHistoryChange,
+  };
+  const notifyHistory = () => callbacksRef.current.onZoomHistoryChange?.(zoomHistoryRef.current.length);
 
   const draw = useCallback(() => {
     const container = containerRef.current;
@@ -169,16 +218,21 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
     xScaleRef.current = xScale;
     chartWidthRef.current = chartWidth;
 
-    // Section boundaries — lines section grows with visible line count
-    const photosBandActive = !!(showPhotos && photos && photos.length > 0);
-    const photosBandTop = 0;
-    const photosBandHeight = photosBandActive ? PHOTO_BAND_HEIGHT : 0;
-    const photosBandBottom = photosBandTop + photosBandHeight;
-    const eventsH = photosBandBottom + (height - photosBandBottom) * EVENT_TOP_PCT;
+    // Section boundaries — lines section grows with visible line count.
+    // Photos are treated as a "line" here: an extra row inside the lines section
+    // when we have photos and the user hasn't hidden them.
+    const hasPhotos = !!(photos && photos.length > 0);
+    const photosRowActive = !!(showPhotos && hasPhotos);
+    const photosRowHeight = photosRowActive ? PHOTO_ROW_HEIGHT : 0;
+    const eventsH = height * EVENT_TOP_PCT;
     const linesY = eventsH;
     const visibleLineCount = lines.filter((l) => l.visible).length;
-    const linesH = Math.max(visibleLineCount * LINE_SPACING + LINES_MIN_PAD, height * 0.15);
+    const linesH = Math.max(visibleLineCount * LINE_SPACING + photosRowHeight + LINES_MIN_PAD, height * 0.15);
     const seasonY = linesY + linesH;
+    // Regular lines come first, photos row goes at the BOTTOM (just above the axis).
+    const regularLineStartY = linesY + 16;
+    // Center of the photos row (used by sidebar label and thumbnails).
+    const photosRowCenter = regularLineStartY + visibleLineCount * LINE_SPACING + photosRowHeight / 2;
 
     // ── Sidebar (fixed, not zoomable) ──
     const sidebar = svg.append("g").attr("class", "sidebar");
@@ -193,20 +247,30 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
 
     const visibleLines = lines.filter((l) => l.visible);
 
-    // Sidebar label for the photos band
-    if (photosBandActive) {
-      sidebar
-        .append("text")
-        .attr("x", SIDEBAR_LEFT_PAD)
-        .attr("y", photosBandTop + photosBandHeight / 2 + 4)
-        .attr("fill", "#666")
-        .attr("font-size", 11)
-        .attr("font-weight", 600)
-        .text("Photos");
+    // Sidebar row for the Photos "line" — visible when we have photos.
+    // Renders like a normal line: checkbox + label. No eye icon (photos are the events).
+    if (hasPhotos && photosRowActive) {
+      const y = photosRowCenter - 7; // align checkbox baseline with regular rows
+      const g = sidebar.append("g").attr("transform", `translate(${SIDEBAR_LEFT_PAD}, ${y})`);
+      const checkSize = 14;
+      g.append("rect")
+        .attr("width", checkSize).attr("height", checkSize).attr("rx", 2)
+        .attr("fill", PHOTO_COLOR).attr("stroke", PHOTO_COLOR).attr("stroke-width", 1.5)
+        .attr("cursor", "pointer")
+        .on("click", () => callbacksRef.current.onToggleShowPhotos?.(false));
+      g.append("text")
+        .attr("x", checkSize / 2).attr("y", checkSize - 2)
+        .attr("text-anchor", "middle").attr("fill", "#fff")
+        .attr("font-size", 11).attr("font-weight", "bold").attr("pointer-events", "none")
+        .text("✓");
+      g.append("text")
+        .attr("x", checkSize + 30).attr("y", checkSize - 2)
+        .attr("fill", PHOTO_COLOR).attr("font-size", 12).attr("font-weight", 500)
+        .text(`Photos (${photos!.length})`);
     }
 
     visibleLines.forEach((line, i) => {
-      const y = linesY + 16 + i * LINE_SPACING;
+      const y = regularLineStartY + i * LINE_SPACING;
       const g = sidebar.append("g").attr("transform", `translate(${SIDEBAR_LEFT_PAD}, ${y})`);
 
       // Checkbox (visibility toggle)
@@ -219,7 +283,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
         .attr("stroke", line.color)
         .attr("stroke-width", 1.5)
         .attr("cursor", "pointer")
-        .on("click", () => onToggleVisible(line.id, !line.visible));
+        .on("click", () => callbacksRef.current.onToggleVisible(line.id, !line.visible));
 
       if (line.visible) {
         g.append("text")
@@ -242,7 +306,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
         .attr("font-size", 13)
         .attr("cursor", "pointer")
         .text(line.events_visible ? "\uD83D\uDC41" : "\u25CB")
-        .on("click", () => onToggleEventsVisible(line.id, !line.events_visible));
+        .on("click", () => callbacksRef.current.onToggleEventsVisible(line.id, !line.events_visible));
 
       // Label
       g.append("text")
@@ -253,12 +317,30 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
         .attr("font-weight", 500)
         .attr("cursor", "pointer")
         .text(line.label.length > 18 ? line.label.slice(0, 17) + "..." : line.label)
-        .on("dblclick", () => onEditLine?.(line));
+        .on("dblclick", () => callbacksRef.current.onEditLine?.(line));
     });
 
-    // Also show hidden lines in sidebar (dimmed, just checkbox)
+    // Also show hidden lines in sidebar (dimmed, just checkbox).
+    // Photos-hidden entry lives here too so the user can bring it back.
     const hiddenLines = lines.filter((l) => !l.visible);
-    const hiddenStartY = linesY + 16 + visibleLines.length * LINE_SPACING + 10;
+    let hiddenStartY = regularLineStartY + visibleLines.length * LINE_SPACING + photosRowHeight + 10;
+
+    if (hasPhotos && !photosRowActive) {
+      const gy = hiddenStartY;
+      const g = sidebar.append("g").attr("transform", `translate(${SIDEBAR_LEFT_PAD}, ${gy})`);
+      const checkSize = 14;
+      g.append("rect")
+        .attr("width", checkSize).attr("height", checkSize).attr("rx", 2)
+        .attr("fill", "#fff").attr("stroke", PHOTO_COLOR).attr("stroke-width", 1)
+        .attr("cursor", "pointer")
+        .on("click", () => callbacksRef.current.onToggleShowPhotos?.(true));
+      g.append("text")
+        .attr("x", checkSize + 30).attr("y", checkSize - 2)
+        .attr("fill", "#bbb").attr("font-size", 12)
+        .text(`Photos (${photos!.length})`);
+      hiddenStartY += LINE_SPACING;
+    }
+
     hiddenLines.forEach((line, i) => {
       const y = hiddenStartY + i * LINE_SPACING;
       const g = sidebar.append("g").attr("transform", `translate(${SIDEBAR_LEFT_PAD}, ${y})`);
@@ -272,7 +354,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
         .attr("stroke", "#ccc")
         .attr("stroke-width", 1)
         .attr("cursor", "pointer")
-        .on("click", () => onToggleVisible(line.id, true));
+        .on("click", () => callbacksRef.current.onToggleVisible(line.id, true));
 
       g.append("text")
         .attr("x", checkSize + 30)
@@ -311,15 +393,6 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
       .attr("y1", seasonY).attr("y2", seasonY)
       .attr("stroke", "#e0e0e0").attr("stroke-dasharray", "4,4");
 
-    // Divider under the photos band (only if the band is active)
-    if (photosBandActive) {
-      chartArea
-        .append("line")
-        .attr("x1", 0).attr("x2", chartWidth)
-        .attr("y1", photosBandBottom).attr("y2", photosBandBottom)
-        .attr("stroke", "#e0e0e0").attr("stroke-dasharray", "4,4");
-    }
-
     // Overlay for zoom — must be BEFORE content so content elements receive dblclick
     const overlay = chartArea
       .append("rect")
@@ -329,6 +402,25 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
       .attr("cursor", "grab");
 
     const content = chartArea.append("g").attr("class", "zoomable");
+
+    // Local helper so in-render click handlers (e.g. photo clusters) can zoom.
+    // Mirrors the logic in the useImperativeHandle zoomTo below.
+    function zoomToRange(start: Date, end: Date) {
+      const [domainStart, domainEnd] = xScale.domain();
+      const s = start < domainStart ? domainStart : start > domainEnd ? domainEnd : start;
+      const e = end < domainStart ? domainStart : end > domainEnd ? domainEnd : end;
+      const x0 = xScale(s);
+      const x1 = xScale(e);
+      const span = x1 - x0;
+      if (span <= 0) return;
+      const k = chartWidth / span;
+      const tx = -x0 * k;
+      const t = d3.zoomIdentity.translate(tx, 0).scale(k);
+      // Remember where we were so the user can zoom back.
+      zoomHistoryRef.current.push(currentTransformRef.current);
+      notifyHistory();
+      overlay.transition().duration(450).call(zoomRef.current!.transform as any, t);
+    }
 
     function renderContent(transform: d3.ZoomTransform) {
       content.selectAll("*").remove();
@@ -351,7 +443,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
       axisG.select(".domain").attr("stroke", "#ccc");
 
       // ── Photos band (top strip) ────────────────────────────────────
-      if (photosBandActive && photos) {
+      if (photosRowActive && photos) {
         interface PhotoPos { photo: TimelinePhoto; x: number; }
         const positioned: PhotoPos[] = [];
         photos.forEach((p) => {
@@ -377,14 +469,13 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
           }
         });
 
-        const bandCenter = photosBandTop + photosBandHeight / 2;
         const halfThumb = PHOTO_THUMB_SIZE / 2;
 
         clusters.forEach((c) => {
-          const g = content.append("g").attr("class", "photo-thumb").style("cursor", "pointer");
           const cx = c.xCenter;
-          const cy = bandCenter;
+          const cy = photosRowCenter;
           if (c.items.length === 1) {
+            const g = content.append("g").attr("class", "photo-thumb").style("cursor", "pointer");
             const p = c.items[0].photo;
             const src = p.thumbnail_url || p.url;
             g.append("clipPath")
@@ -414,9 +505,90 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
               .attr("stroke-width", 1.5);
             g.on("click", (event: MouseEvent) => {
               event.stopPropagation();
-              onClickPhoto?.(p, event.clientX, event.clientY);
+              callbacksRef.current.onClickPhoto?.(p, event.clientX, event.clientY);
             });
+            g.on("mouseenter", function () {
+              const node = this as unknown as SVGGElement;
+              callbacksRef.current.onHoverPhoto?.(p, node.getBoundingClientRect());
+            });
+            g.on("mouseleave", () => {
+              callbacksRef.current.onUnhoverPhoto?.();
+            });
+          } else if (
+            c.items.length <= PHOTO_SPREAD_MAX &&
+            // Only force-spread when the user has zoomed in enough that some
+            // natural time-separation exists. Below the threshold we keep the
+            // +N bubble so users can hover-delete the whole cluster and click
+            // to zoom further (which spreads them once the threshold is met).
+            (c.items[c.items.length - 1].x - c.items[0].x) >= PHOTO_THUMB_SIZE
+          ) {
+            // Force-spread: lay each thumb out at THUMB_SIZE + GAP intervals
+            // centered on cluster's xCenter. Draw a connector line + tick from
+            // each thumb down to its actual position on the time axis.
+            const spreadStep = PHOTO_THUMB_SIZE + PHOTO_THUMB_GAP;
+            const n = c.items.length;
+            const totalW = n * spreadStep - PHOTO_THUMB_GAP;
+            const firstCenter = cx - totalW / 2 + halfThumb;
+            const axisY = seasonY - 2;
+            c.items.forEach((item, i) => {
+              const thumbX = firstCenter + i * spreadStep;
+              const trueX = item.x;
+              const p = item.photo;
+              const src = p.thumbnail_url || p.url;
+
+              const itemG = content.append("g").attr("class", "photo-thumb-spread").style("cursor", "pointer");
+              const connector = itemG.append("line")
+                .attr("x1", thumbX)
+                .attr("y1", cy + halfThumb + 1)
+                .attr("x2", trueX)
+                .attr("y2", axisY)
+                .attr("stroke", "#bbb")
+                .attr("stroke-width", 1)
+                .attr("stroke-dasharray", "2,2");
+              const tick = itemG.append("line")
+                .attr("x1", trueX).attr("x2", trueX)
+                .attr("y1", axisY - 3).attr("y2", axisY + 3)
+                .attr("stroke", "#888")
+                .attr("stroke-width", 1);
+
+              itemG.append("clipPath")
+                .attr("id", `photo-clip-${p.id}`)
+                .append("rect")
+                .attr("x", thumbX - halfThumb).attr("y", cy - halfThumb)
+                .attr("width", PHOTO_THUMB_SIZE).attr("height", PHOTO_THUMB_SIZE)
+                .attr("rx", 4);
+              itemG.append("image")
+                .attr("href", src)
+                .attr("x", thumbX - halfThumb).attr("y", cy - halfThumb)
+                .attr("width", PHOTO_THUMB_SIZE).attr("height", PHOTO_THUMB_SIZE)
+                .attr("preserveAspectRatio", "xMidYMid slice")
+                .attr("clip-path", `url(#photo-clip-${p.id})`);
+              itemG.append("rect")
+                .attr("x", thumbX - halfThumb).attr("y", cy - halfThumb)
+                .attr("width", PHOTO_THUMB_SIZE).attr("height", PHOTO_THUMB_SIZE)
+                .attr("rx", 4).attr("fill", "none")
+                .attr("stroke", "#fff").attr("stroke-width", 1.5);
+
+              itemG.on("click", (event: MouseEvent) => {
+                event.stopPropagation();
+                callbacksRef.current.onClickPhoto?.(p, event.clientX, event.clientY);
+              });
+              itemG.on("mouseenter", function () {
+                const node = this as unknown as SVGGElement;
+                connector.attr("stroke", PHOTO_COLOR).attr("stroke-width", 2).attr("stroke-dasharray", null);
+                tick.attr("stroke", PHOTO_COLOR).attr("stroke-width", 2);
+                callbacksRef.current.onHoverPhoto?.(p, node.getBoundingClientRect());
+              });
+              itemG.on("mouseleave", () => {
+                connector.attr("stroke", "#bbb").attr("stroke-width", 1).attr("stroke-dasharray", "2,2");
+                tick.attr("stroke", "#888").attr("stroke-width", 1);
+                callbacksRef.current.onUnhoverPhoto?.();
+              });
+            });
+            // Skip the +N branch for this cluster.
+            return;
           } else {
+            const g = content.append("g").attr("class", "photo-thumb").style("cursor", "pointer");
             // Cluster bubble: show first photo as background + count badge
             const p = c.items[0].photo;
             const src = p.thumbnail_url || p.url;
@@ -455,7 +627,30 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
               .text(`+${c.items.length}`);
             g.on("click", (event: MouseEvent) => {
               event.stopPropagation();
-              onClickPhotoCluster?.(c.items.map((i) => i.photo), event.clientX, event.clientY);
+              // Primary behavior: zoom in on the cluster so it spreads out.
+              // Compute a padded time window from the cluster's actual timestamps.
+              const times = c.items
+                .map((i) => new Date(i.photo.taken_at).getTime())
+                .filter((t) => !isNaN(t));
+              if (times.length > 0) {
+                const minT = Math.min(...times);
+                const maxT = Math.max(...times);
+                // Add 10% padding on each side, minimum 30 minutes so a tight burst still opens up.
+                const span = Math.max(maxT - minT, 30 * 60 * 1000);
+                const pad = span * 0.1;
+                const start = new Date(minT - pad);
+                const end = new Date(maxT + pad);
+                zoomToRange(start, end);
+              }
+              // Still emit the callback for consumers that want it.
+              callbacksRef.current.onClickPhotoCluster?.(c.items.map((i) => i.photo), event.clientX, event.clientY);
+            });
+            g.on("mouseenter", function () {
+              const node = this as unknown as SVGGElement;
+              callbacksRef.current.onHoverCluster?.(c.items.map((i) => i.photo), node.getBoundingClientRect());
+            });
+            g.on("mouseleave", () => {
+              callbacksRef.current.onUnhoverCluster?.();
             });
           }
         });
@@ -574,7 +769,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
           const y = e.clientY;
           pendingClick = setTimeout(() => {
             pendingClick = null;
-            onClickEvent?.(ev, x, y);
+            callbacksRef.current.onClickEvent?.(ev, x, y);
           }, 220);
         };
         const handleDblClick = (e: MouseEvent) => {
@@ -583,7 +778,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
             clearTimeout(pendingClick);
             pendingClick = null;
           }
-          onEditEvent?.(ev);
+          callbacksRef.current.onEditEvent?.(ev);
         };
 
         content
@@ -740,8 +935,8 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
           const y = e.clientY;
           pendingClick = setTimeout(() => {
             pendingClick = null;
-            if (kind === "season" && season) onClickSeason?.(season, x, y);
-            else if (kind === "event" && event) onClickEvent?.(event, x, y);
+            if (kind === "season" && season) callbacksRef.current.onClickSeason?.(season, x, y);
+            else if (kind === "event" && event) callbacksRef.current.onClickEvent?.(event, x, y);
           }, 220);
         };
         const onBoxDblClick = (e: MouseEvent) => {
@@ -750,8 +945,8 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
             clearTimeout(pendingClick);
             pendingClick = null;
           }
-          if (kind === "season" && season) onEditSeason?.(season);
-          else if (kind === "event" && event) onEditEvent?.(event);
+          if (kind === "season" && season) callbacksRef.current.onEditSeason?.(season);
+          else if (kind === "event" && event) callbacksRef.current.onEditEvent?.(event);
         };
 
         content.append("rect")
@@ -775,7 +970,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
     // ── Zoom behavior ──
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.1, 200])
+      .scaleExtent([0.1, 100000])
       .translateExtent([
         [0, 0],
         [chartWidth, height],
@@ -786,6 +981,7 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
       ])
       .on("zoom", (event) => {
         renderContent(event.transform);
+        currentTransformRef.current = event.transform;
       });
 
     zoomRef.current = zoom;
@@ -793,9 +989,23 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
 
     overlay.call(zoom as any).on("dblclick.zoom", null);
 
-    // Initial render
-    renderContent(d3.zoomIdentity);
-  }, [lines, events, seasons, birthDate, onToggleVisible, onToggleEventsVisible, onEditEvent, onEditSeason, onEditLine, onClickEvent, onClickSeason, selectedEventId, selectedSeasonId]);
+    // Restore the last-known zoom transform so that a resize / re-mount / any
+    // parent-triggered redraw (e.g. opening the lightbox, which briefly resizes
+    // the viewport) doesn't blow away the user's zoom position.
+    // First render will hit d3.zoomIdentity naturally since currentTransformRef
+    // is initialized to it.
+    const restore = currentTransformRef.current;
+    if (restore && restore.k !== 1) {
+      // Use zoom.transform so the d3-zoom behavior's internal state is in sync
+      // with what's rendered; this also fires the "zoom" handler which calls
+      // renderContent for us.
+      overlay.call(zoom.transform as unknown as (sel: typeof overlay, t: d3.ZoomTransform) => void, restore);
+    } else {
+      renderContent(d3.zoomIdentity);
+    }
+    // callbacks are read through callbacksRef.current inside draw, so parent
+    // re-renders that only change callback identity don't force a redraw.
+  }, [lines, events, seasons, photos, showPhotos, birthDate, selectedEventId, selectedSeasonId]);
 
   useEffect(() => {
     draw();
@@ -821,8 +1031,20 @@ const TimelineViz = forwardRef<TimelineVizHandle, TimelineVizProps>(function Tim
       const k = chartWidth / span;
       const tx = -x0 * k;
       const t = d3.zoomIdentity.translate(tx, 0).scale(k);
+      zoomHistoryRef.current.push(currentTransformRef.current);
+      notifyHistory();
       overlay.transition().duration(450).call(zoom.transform as any, t);
     },
+    zoomBack: () => {
+      const prev = zoomHistoryRef.current.pop();
+      const zoom = zoomRef.current;
+      const overlay = overlayRef.current;
+      if (!prev || !zoom || !overlay) return false;
+      notifyHistory();
+      overlay.transition().duration(350).call(zoom.transform as any, prev);
+      return true;
+    },
+    canZoomBack: () => zoomHistoryRef.current.length > 0,
   }), []);
 
   return (

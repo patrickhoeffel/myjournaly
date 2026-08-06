@@ -5,6 +5,7 @@ import {
   LossesPicker,
   TagsPicker,
   PeoplePicker,
+  PlacesPicker,
   EventsPicker,
   NotesPicker,
 } from "./LinkPickers";
@@ -21,6 +22,10 @@ interface AssociationsPanelProps {
   refreshKey?: number | string;
   /** Show the People picker. Off by default on the People page (you can't link a person to themselves usefully). */
   showPeoplePicker?: boolean;
+  /** Show the Locations picker inside this panel. Off for the PhotoLightbox, which renders Locations as its own dedicated section. */
+  showLocationsPicker?: boolean;
+  /** Force a single-column stacked layout regardless of viewport (used inside narrow side panels). */
+  compact?: boolean;
 }
 
 /**
@@ -28,7 +33,7 @@ interface AssociationsPanelProps {
  *
  * Layout:
  *  - Row 1 (responsive 1/2/4 cols): Feelings | Beliefs | Losses | Tags
- *  - Row 2 (responsive 1/2/3 cols): People | Events | Notes
+ *  - Row 2 (responsive 1/2/3/4 cols): People | Locations | Events | Notes
  */
 export default function AssociationsPanel({
   entityId,
@@ -38,6 +43,8 @@ export default function AssociationsPanel({
   emptyMessage = "Save first to add associations.",
   refreshKey,
   showPeoplePicker = true,
+  showLocationsPicker = true,
+  compact = false,
 }: AssociationsPanelProps) {
   const labeledTiles = [
     { label: "Feelings", component: <FeelingsPicker fromId={entityId} fromType={entityType} fromName={entityName} /> },
@@ -60,7 +67,7 @@ export default function AssociationsPanel({
       ) : (
         <Box key={refreshKey} sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
           {/* Row 1: labeled tiles (Feelings, Beliefs, Losses, Tags) */}
-          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr", md: "1fr 1fr 1fr 1fr" }, gap: 1.5 }}>
+          <Box sx={{ display: "grid", gridTemplateColumns: compact ? "1fr" : { xs: "1fr", sm: "1fr 1fr", md: "1fr 1fr 1fr 1fr" }, gap: 1.5 }}>
             {labeledTiles.map(({ label, component }) => (
               <Box
                 key={label}
@@ -94,10 +101,13 @@ export default function AssociationsPanel({
             ))}
           </Box>
 
-          {/* Row 2: People, Events, Notes */}
-          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr", md: "1fr 1fr 1fr" }, gap: 1.5 }}>
+          {/* Row 2: People, [Locations,] Events, Notes */}
+          <Box sx={{ display: "grid", gridTemplateColumns: compact ? "1fr" : { xs: "1fr", sm: "1fr 1fr", md: ((showPeoplePicker ? 1 : 0) + (showLocationsPicker ? 1 : 0) + 2) === 4 ? "1fr 1fr 1fr 1fr" : "1fr 1fr 1fr" }, gap: 1.5 }}>
             {showPeoplePicker && (
               <PeoplePicker fromId={entityId} fromType={entityType} fromName={entityName} />
+            )}
+            {showLocationsPicker && (
+              <PlacesPicker fromId={entityId} fromType={entityType} fromName={entityName} />
             )}
             <EventsPicker fromId={entityId} fromType={entityType} fromName={entityName} />
             <NotesPicker fromId={entityId} fromType={entityType} fromName={entityName} />

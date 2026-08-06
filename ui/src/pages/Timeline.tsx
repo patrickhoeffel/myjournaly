@@ -23,7 +23,7 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
-import { Add, AddPhotoAlternate, Close, Map as MapIcon, PhotoLibrary, PushPin, PushPinOutlined, Refresh } from "@mui/icons-material";
+import { Add, AddPhotoAlternate, ArrowBack, Close, Map as MapIcon, PushPin, PushPinOutlined, Refresh } from "@mui/icons-material";
 import { apiFetch } from "../lib/api";
 import EventDialog, { emptyEventForm, type EventFormData } from "../components/EventDialog";
 import TimelineMap from "../components/TimelineMap";
@@ -68,6 +68,20 @@ export default function Timeline() {
   // Photos
   const [photos, setPhotos] = useState<TimelinePhoto[]>([]);
   const [showPhotos, setShowPhotos] = useState(true);
+  const [zoomHistoryDepth, setZoomHistoryDepth] = useState(0);
+  const [hoveredPhoto, setHoveredPhoto] = useState<{ photo: TimelinePhoto; rect: DOMRect } | null>(null);
+  const [hoveredCluster, setHoveredCluster] = useState<{ photos: TimelinePhoto[]; rect: DOMRect } | null>(null);
+  const clusterHoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleClusterClose = useCallback(() => {
+    if (clusterHoverTimeoutRef.current) clearTimeout(clusterHoverTimeoutRef.current);
+    clusterHoverTimeoutRef.current = setTimeout(() => setHoveredCluster(null), 250);
+  }, []);
+  const cancelClusterClose = useCallback(() => {
+    if (clusterHoverTimeoutRef.current) {
+      clearTimeout(clusterHoverTimeoutRef.current);
+      clusterHoverTimeoutRef.current = null;
+    }
+  }, []);
   const [photoDropzoneOpen, setPhotoDropzoneOpen] = useState(false);
   const [lightboxPhotos, setLightboxPhotos] = useState<TimelinePhoto[] | null>(null);
   const [lightboxIndex, setLightboxIndex] = useState(0);
@@ -75,12 +89,21 @@ export default function Timeline() {
   const loadPhotos = useCallback(async () => {
     try {
       const data = await apiFetch("/photos");
+      // Safety net for legacy records: if the stored taken_at lacks any timezone
+      // info (naive ISO like "2026-08-03T17:54:46"), assume UTC. The old server
+      // stripped the Z when it shouldn't have; this makes display correct even
+      // if the migration hasn't been run.
+      const normalize = (iso: string): string => {
+        if (!iso) return iso;
+        const hasTz = iso.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(iso);
+        return hasTz ? iso : `${iso}Z`;
+      };
       setPhotos(
         (data as Array<Record<string, unknown>>).map((p) => ({
           id: p.id as string,
           url: p.url as string,
           thumbnail_url: (p.thumbnail_url as string | null) ?? null,
-          taken_at: (p.taken_at as string) || (p.created_at as string),
+          taken_at: normalize((p.taken_at as string) || (p.created_at as string)),
           caption: (p.caption as string | null) ?? null,
           gps_lat: (p.gps_lat as number | null) ?? null,
           gps_lng: (p.gps_lng as number | null) ?? null,
@@ -99,6 +122,26 @@ export default function Timeline() {
     const end = new Date();
     end.setHours(21, 0, 0, 0);
     vizRef.current?.zoomTo(start, end);
+  }, []);
+
+  const zoomToClusterPhotos = useCallback((ps: TimelinePhoto[]) => {
+    const times = ps.map((p) => new Date(p.taken_at).getTime()).filter((t) => !isNaN(t));
+    if (times.length === 0) return;
+    const minT = Math.min(...times);
+    const maxT = Math.max(...times);
+    const span = Math.max(maxT - minT, 30 * 60 * 1000);
+    const pad = span * 0.1;
+    vizRef.current?.zoomTo(new Date(minT - pad), new Date(maxT + pad));
+  }, []);
+
+  const deletePhotos = useCallback(async (ps: TimelinePhoto[]) => {
+    const ids = ps.map((p) => p.id);
+    const results = await Promise.allSettled(
+      ids.map((id) => apiFetch(`/photos/${id}`, { method: "DELETE" }))
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    setPhotos((prev) => prev.filter((p) => !ids.includes(p.id)));
+    return { deleted: ids.length - failed, failed };
   }, []);
 
   interface EventSummary {
@@ -520,6 +563,17 @@ export default function Timeline() {
             </Select>
           </FormControl>
         )}
+        <Tooltip title="Undo last zoom">
+          <span>
+            <IconButton
+              size="small"
+              onClick={() => vizRef.current?.zoomBack()}
+              disabled={zoomHistoryDepth === 0}
+            >
+              <ArrowBack fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
         <Tooltip title="Zoom to today (daytime)">
           <Button size="small" variant="outlined" onClick={zoomToToday} sx={{ textTransform: "none" }}>
             Today
@@ -529,18 +583,6 @@ export default function Timeline() {
           <IconButton size="small" onClick={() => setPhotoDropzoneOpen(true)}>
             <AddPhotoAlternate />
           </IconButton>
-        </Tooltip>
-        <Tooltip title={showPhotos ? "Hide photos band" : "Show photos band"}>
-          <span>
-            <IconButton
-              size="small"
-              onClick={() => setShowPhotos((v) => !v)}
-              color={showPhotos ? "primary" : "default"}
-              disabled={photos.length === 0}
-            >
-              <PhotoLibrary fontSize="small" sx={{ opacity: showPhotos ? 1 : 0.5 }} />
-            </IconButton>
-          </span>
         </Tooltip>
         <Tooltip title={mapVisible ? "Hide map" : "Show map"}>
           <IconButton
@@ -602,8 +644,23 @@ export default function Timeline() {
               onEditLine={openEditLine}
               onClickEvent={handleEventClick}
               onClickSeason={handleSeasonClick}
-              onClickPhoto={(p) => { setLightboxPhotos([p]); setLightboxIndex(0); }}
-              onClickPhotoCluster={(ps) => { setLightboxPhotos(ps); setLightboxIndex(0); }}
+              onClickPhoto={(p) => {
+                // Open the lightbox with the ENTIRE list so left/right pages
+                // through everything, positioned at the clicked photo.
+                const sorted = [...photos].sort((a, b) => new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime());
+                const idx = sorted.findIndex((x) => x.id === p.id);
+                setLightboxPhotos(sorted);
+                setLightboxIndex(Math.max(0, idx));
+              }}
+              onHoverPhoto={(photo, rect) => setHoveredPhoto({ photo, rect })}
+              onUnhoverPhoto={() => setHoveredPhoto(null)}
+              onHoverCluster={(photos, rect) => { cancelClusterClose(); setHoveredCluster({ photos, rect }); }}
+              onUnhoverCluster={scheduleClusterClose}
+              onToggleShowPhotos={setShowPhotos}
+              onZoomHistoryChange={setZoomHistoryDepth}
+              /* Cluster click zooms the timeline to the cluster's range (handled inside TimelineViz).
+                 We don't open the lightbox here — that would obscure the zoom animation.
+                 To view the photos, zoom in enough to see individual thumbs, then click one. */
               selectedEventId={tooltip?.kind === "event" ? tooltip.eventId : null}
               selectedSeasonId={tooltip?.kind === "season" ? tooltip.season.id : null}
             />
@@ -935,8 +992,154 @@ export default function Timeline() {
           photos={lightboxPhotos}
           initialIndex={lightboxIndex}
           onClose={() => setLightboxPhotos(null)}
+          onDelete={async (photoId) => {
+            try {
+              await apiFetch(`/photos/${photoId}`, { method: "DELETE" });
+              setPhotos((prev) => prev.filter((p) => p.id !== photoId));
+              setLightboxPhotos((prev) => {
+                if (!prev) return prev;
+                const next = prev.filter((p) => p.id !== photoId);
+                if (next.length === 0) return null; // close if nothing left
+                return next;
+              });
+              notify("Photo deleted");
+            } catch {
+              notify("Failed to delete photo", "error");
+            }
+          }}
+          onCaptionChange={async (photoId, caption) => {
+            try {
+              await apiFetch(`/photos/${photoId}`, { method: "PUT", body: JSON.stringify({ caption }) });
+              setPhotos((prev) => prev.map((p) => (p.id === photoId ? { ...p, caption } : p)));
+              setLightboxPhotos((prev) => prev && prev.map((p) => (p.id === photoId ? { ...p, caption } : p)));
+            } catch {
+              notify("Failed to save caption", "error");
+            }
+          }}
         />
       )}
+
+      {hoveredPhoto && (() => {
+        // Anchor the preview above the hovered thumb (or below if there's no room above).
+        const PREVIEW_MAX = 200;
+        const centerX = hoveredPhoto.rect.left + hoveredPhoto.rect.width / 2;
+        const canFitAbove = hoveredPhoto.rect.top > PREVIEW_MAX + 24;
+        const top = canFitAbove
+          ? hoveredPhoto.rect.top - PREVIEW_MAX - 12
+          : hoveredPhoto.rect.bottom + 12;
+        // Clamp horizontally so the preview stays on screen
+        const half = PREVIEW_MAX / 2;
+        const leftClamped = Math.max(8, Math.min(window.innerWidth - PREVIEW_MAX - 8, centerX - half));
+        const fmt = (iso: string) => {
+          try { return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
+          catch { return iso; }
+        };
+        return (
+          <Box
+            sx={{
+              position: "fixed",
+              top,
+              left: leftClamped,
+              width: PREVIEW_MAX,
+              zIndex: 2000,
+              pointerEvents: "none",
+              boxShadow: 4,
+              borderRadius: 1,
+              overflow: "hidden",
+              bgcolor: "background.paper",
+            }}
+          >
+            <Box
+              component="img"
+              src={hoveredPhoto.photo.url}
+              alt=""
+              sx={{ display: "block", width: "100%", height: "auto", maxHeight: PREVIEW_MAX, objectFit: "cover" }}
+            />
+            <Box sx={{ px: 1, py: 0.5, fontSize: "0.7rem", color: "text.secondary", textAlign: "center" }}>
+              {fmt(hoveredPhoto.photo.taken_at)}
+              {hoveredPhoto.photo.caption ? ` — ${hoveredPhoto.photo.caption}` : ""}
+            </Box>
+          </Box>
+        );
+      })()}
+
+      {hoveredCluster && (() => {
+        const MENU_WIDTH = 220;
+        const MENU_HEIGHT = 116;
+        const centerX = hoveredCluster.rect.left + hoveredCluster.rect.width / 2;
+        const canFitAbove = hoveredCluster.rect.top > MENU_HEIGHT + 12;
+        const top = canFitAbove
+          ? hoveredCluster.rect.top - MENU_HEIGHT - 8
+          : hoveredCluster.rect.bottom + 8;
+        const leftClamped = Math.max(8, Math.min(window.innerWidth - MENU_WIDTH - 8, centerX - MENU_WIDTH / 2));
+        const times = hoveredCluster.photos
+          .map((p) => new Date(p.taken_at).getTime())
+          .filter((t) => !isNaN(t));
+        const range = (() => {
+          if (times.length === 0) return "";
+          const min = new Date(Math.min(...times));
+          const max = new Date(Math.max(...times));
+          const fmt = (d: Date) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          return min.getTime() === max.getTime() ? fmt(min) : `${fmt(min)} – ${fmt(max)}`;
+        })();
+        const count = hoveredCluster.photos.length;
+        return (
+          <Box
+            onMouseEnter={cancelClusterClose}
+            onMouseLeave={scheduleClusterClose}
+            sx={{
+              position: "fixed",
+              top,
+              left: leftClamped,
+              width: MENU_WIDTH,
+              zIndex: 2000,
+              boxShadow: 4,
+              borderRadius: 1,
+              overflow: "hidden",
+              bgcolor: "background.paper",
+              border: 1,
+              borderColor: "divider",
+            }}
+          >
+            <Box sx={{ px: 1.25, py: 0.75, borderBottom: 1, borderColor: "divider", bgcolor: "action.hover" }}>
+              <Typography variant="caption" sx={{ fontWeight: 600, display: "block", lineHeight: 1.3 }}>
+                {count} photos
+              </Typography>
+              {range && (
+                <Typography variant="caption" sx={{ color: "text.secondary", display: "block", lineHeight: 1.2 }}>
+                  {range}
+                </Typography>
+              )}
+            </Box>
+            <Button
+              size="small"
+              fullWidth
+              onClick={() => {
+                zoomToClusterPhotos(hoveredCluster.photos);
+                setHoveredCluster(null);
+              }}
+              sx={{ justifyContent: "flex-start", textTransform: "none", borderRadius: 0, px: 1.25 }}
+            >
+              Expand into range
+            </Button>
+            <Button
+              size="small"
+              fullWidth
+              color="error"
+              onClick={async () => {
+                if (!confirm(`Delete all ${count} photos in this stack? This cannot be undone.`)) return;
+                const { deleted, failed } = await deletePhotos(hoveredCluster.photos);
+                setHoveredCluster(null);
+                if (failed > 0) notify(`Deleted ${deleted}, ${failed} failed`, "error");
+                else notify(`Deleted ${deleted} photos`);
+              }}
+              sx={{ justifyContent: "flex-start", textTransform: "none", borderRadius: 0, px: 1.25, borderTop: 1, borderColor: "divider" }}
+            >
+              Delete all {count}
+            </Button>
+          </Box>
+        );
+      })()}
     </Box>
   );
 }

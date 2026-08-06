@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import uuid
@@ -6,7 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from firebase_admin import storage as fb_storage
 
-from app.models.photo import Photo
+from app.models.photo import Photo, _to_utc_aware
 from app.services.auth import get_current_user
 from app.services.firestore import get_firestore_client, PHOTOS
 
@@ -22,13 +23,8 @@ def _get_bucket():
 
 
 def _parse_iso(dt_str: str | None) -> datetime | None:
-    if not dt_str:
-        return None
-    try:
-        # Accept both "2024-01-15T10:30:00" and "2024-01-15T10:30:00Z"
-        return datetime.fromisoformat(dt_str.rstrip("Z"))
-    except ValueError:
-        return None
+    """Parse an ISO string and normalize to UTC-aware. Matches the Photo model validator."""
+    return _to_utc_aware(dt_str)
 
 
 @router.post("", response_model=Photo)
@@ -58,6 +54,19 @@ async def upload_photo(
         raise HTTPException(status_code=400, detail="File too large (max 20MB)")
 
     user_id = user["uid"]
+    sha256_hash = hashlib.sha256(contents).hexdigest()
+
+    # Dedup: if this user already has a photo with the same content hash, return it.
+    db = get_firestore_client()
+    dupe_q = (
+        db.collection(PHOTOS)
+        .where("user_id", "==", user_id)
+        .where("sha256_hash", "==", sha256_hash)
+        .limit(1)
+    )
+    async for doc in dupe_q.stream():
+        return Photo.from_firestore(doc.id, doc.to_dict())
+
     ext = (
         file.filename.rsplit(".", 1)[-1].lower()
         if file.filename and "." in file.filename
@@ -69,7 +78,10 @@ async def upload_photo(
     bucket = _get_bucket()
     blob = bucket.blob(path)
     blob.upload_from_string(contents, content_type=file.content_type)
-    blob.make_public()
+    # Bucket uses uniform bucket-level access; per-object ACLs are disallowed.
+    # Rely on bucket-level IAM (allUsers → Storage Object Viewer) and just
+    # construct the canonical public URL.
+    public_url = f"https://storage.googleapis.com/{bucket.name}/{path}"
 
     exif_blob: dict | None = None
     if exif_json:
@@ -81,7 +93,7 @@ async def upload_photo(
     photo = Photo(
         user_id=user_id,
         storage_path=path,
-        url=blob.public_url,
+        url=public_url,
         thumbnail_url=None,
         original_filename=original_filename or file.filename,
         mime_type=file.content_type or "image/jpeg",
@@ -93,9 +105,9 @@ async def upload_photo(
         gps_lng=gps_lng,
         gps_altitude=gps_altitude,
         exif=exif_blob,
+        sha256_hash=sha256_hash,
     )
 
-    db = get_firestore_client()
     data = photo.to_firestore()
     doc_ref = db.collection(PHOTOS).document()
     await doc_ref.set(data)

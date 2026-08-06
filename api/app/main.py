@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-VERSION = "0.1.21"
+VERSION = "0.1.26"
 
 app = FastAPI(
     title="My Journaly API",

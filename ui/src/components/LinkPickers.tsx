@@ -591,6 +591,87 @@ export function BeliefsPicker({ fromId, fromType, fromName, label }: BeliefsPick
 
 // ── People Picker ──
 
+interface PlaceOption {
+  id: string;
+  name: string;
+  address: string;
+}
+
+interface PlacesPickerProps {
+  fromId: string | null;
+  fromType: string;
+  fromName: string;
+}
+
+export function PlacesPicker({ fromId, fromType, fromName }: PlacesPickerProps) {
+  const { links, addLink, removeLink } = useEntityLinks(fromId, fromType, fromName);
+  const [options, setOptions] = useState<PlaceOption[]>([]);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    apiFetch("/places").then((data) =>
+      setOptions(
+        data.map((p: Record<string, string>) => ({
+          id: p.id,
+          name: p.name,
+          address: p.formatted_address || "",
+        }))
+      )
+    ).catch(() => {});
+  }, []);
+
+  const placeLinks = links.filter((l) => l.to_type === "place");
+  const selectedIds = new Set(placeLinks.map((l) => l.to_id));
+  const selectedOptions = options.filter((o) => selectedIds.has(o.id));
+  const availableOptions = options.filter((o) => !selectedIds.has(o.id));
+
+  return (
+    <Autocomplete
+      multiple
+      size="small"
+      options={availableOptions}
+      getOptionLabel={(o) => o.name}
+      value={selectedOptions}
+      onChange={(_ev, _newVal, reason, details) => {
+        if (reason === "selectOption" && details?.option) {
+          addLink(details.option.id, "place", details.option.name);
+        } else if (reason === "removeOption" && details?.option) {
+          const link = placeLinks.find((l) => l.to_id === details.option.id);
+          if (link) removeLink(link.id);
+        } else if (reason === "clear") {
+          placeLinks.forEach((l) => removeLink(l.id));
+        }
+      }}
+      renderInput={(params) => <TextField {...params} label="Locations" placeholder="Link a place..." />}
+      renderOption={(props, option) => (
+        <li {...props} key={option.id}>
+          <Box>
+            <Typography variant="body2">{option.name}</Typography>
+            {option.address && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                {option.address}
+              </Typography>
+            )}
+          </Box>
+        </li>
+      )}
+      renderTags={(value, getTagProps) =>
+        value.map((option, index) => (
+          <Chip
+            {...getTagProps({ index })}
+            key={option.id}
+            label={option.name}
+            size="small"
+            variant="outlined"
+            onDoubleClick={() => navigate(`/places?place=${option.id}`)}
+          />
+        ))
+      }
+      isOptionEqualToValue={(opt, val) => opt.id === val.id}
+    />
+  );
+}
+
 interface PeoplePickerProps {
   fromId: string | null;
   fromType: string;
